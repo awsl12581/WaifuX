@@ -275,6 +275,8 @@ final class WallpaperEngineXBridge: ObservableObject {
     private var screenWatchdogs: [pid_t: DispatchWorkItem] = [:]
     /// crop 等待 Task（key = screenID），新的 setWallpaper 开始前先 cancel 旧的
     private var cropWaitTasks: [String: Task<Void, Never>] = [:]
+    /// Scene 路径 → orthogonalprojection 尺寸；nil 表示读过但没有。
+    private var sceneCanvasSizeCache: [String: CGSize?] = [:]
     /// 每屏最近一次读到的 scene canvas 尺寸。热切换会删 canvas-size 文件，新文件没写出前用它重算 crop。
     private var lastCanvasSizeByScreenID: [String: CGSize] = [:]
     /// 非隔离存储所有活跃 PID，供 deinit 中安全清理
@@ -986,13 +988,23 @@ final class WallpaperEngineXBridge: ObservableObject {
             let audioControlURL = createAudioControlURL(screenID: screenID)
             let wallpaperControlURL = createWallpaperControlURL(screenID: screenID)
 
-            // 初始裁切
+            // 初始裁切。优先用画布/视频真实尺寸算居中 cover，避免渲染器默认 Cover 偏一侧。
             let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
             let initialLayout: (crop: UnitRect, viewport: UnitRect)? = {
                 guard cropSettings.shouldApplyCrop else { return nil }
-                let wallpaperSize = readCanvasSize(url: canvasSizeURL) ?? CGSize(width: screenW, height: screenH)
+                let wallpaperSize = cropWallpaperSize(
+                    screen: screen,
+                    path: resolvedPath,
+                    canvasSizeURL: canvasSizeURL,
+                    allowCachedCanvas: false
+                )
+                if wallpaperSize == nil,
+                   cropSettings.aspectPreset == .autoFill
+                    || (cropSettings.aspectPreset == .custom && cropSettings.customAspect == nil) {
+                    return nil
+                }
                 let layout = CropLayoutEngine.compute(
-                    wallpaperSize: wallpaperSize,
+                    wallpaperSize: wallpaperSize ?? CGSize(width: screenW, height: screenH),
                     screenSize: CGSize(width: screenW, height: screenH),
                     settings: cropSettings)
                 return (crop: layout.wallpaperCropRect, viewport: layout.viewportRect)
@@ -3407,12 +3419,46 @@ final class WallpaperEngineXBridge: ObservableObject {
         return CGSize(width: w, height: h)
     }
 
-    /// 供 overlay 预览取 wgpu canvas 尺寸（scene 就绪后才有值）。
+    /// 供 overlay 预览取 wgpu canvas 尺寸（scene 就绪后才有值；未就绪时用 scene.json 画布）。
     func canvasSize(for screen: NSScreen) -> CGSize? {
         let screenID = screen.wallpaperScreenIdentifier
         let info = screenProcesses[screenID]
             ?? screenProcesses.values.first(where: { $0.screenID == screenID })
-        return readCanvasSize(url: info?.canvasSizeURL)
+        return cropWallpaperSize(
+            screen: screen,
+            path: renderState(for: screen)?.path,
+            canvasSizeURL: info?.canvasSizeURL,
+            allowCachedCanvas: true
+        )
+    }
+
+    /// 铺满裁切用的壁纸尺寸：真实画布 > scene ortho / Web 内容 > 缓存。
+    private func cropWallpaperSize(
+        screen: NSScreen,
+        path: String?,
+        canvasSizeURL: URL?,
+        allowCachedCanvas: Bool
+    ) -> CGSize? {
+        if let size = readCanvasSize(url: canvasSizeURL) {
+            return size
+        }
+        if let path, let size = sceneCanvasSize(forPath: path) {
+            return size
+        }
+        if let size = webContentSize(for: screen) {
+            return size
+        }
+        if allowCachedCanvas {
+            return lastCanvasSizeByScreenID[screen.wallpaperScreenIdentifier]
+        }
+        return nil
+    }
+
+    private func sceneCanvasSize(forPath path: String) -> CGSize? {
+        if let cached = sceneCanvasSizeCache[path] { return cached }
+        let size = SceneConfigOverrideService.sceneOrthogonalSize(for: path)
+        sceneCanvasSizeCache[path] = size
+        return size
     }
 
     private func writeAudioControl(url: URL, muted: Bool, paused: Bool, volume: Double) {
@@ -4501,7 +4547,12 @@ final class WallpaperEngineXBridge: ObservableObject {
         if let freshSize {
             lastCanvasSizeByScreenID[screenID] = freshSize
         }
-        let knownSize = freshSize ?? lastCanvasSizeByScreenID[screenID]
+        let knownSize = cropWallpaperSize(
+            screen: screen,
+            path: renderState(for: screen)?.path,
+            canvasSizeURL: info?.canvasSizeURL,
+            allowCachedCanvas: true
+        )
         let nextCrop: UnitRect?
         let nextViewport: UnitRect?
         if cropSettings.shouldApplyCrop {
