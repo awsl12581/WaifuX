@@ -281,6 +281,10 @@ final class WallpaperEngineXBridge: ObservableObject {
     private var screenWatchdogs: [pid_t: DispatchWorkItem] = [:]
     /// crop 等待 Task（key = screenID），新的 setWallpaper 开始前先 cancel 旧的
     private var cropWaitTasks: [String: Task<Void, Never>] = [:]
+    /// Scene 路径 → orthogonalprojection 尺寸；nil 表示读过但没有。
+    private var sceneCanvasSizeCache: [String: CGSize?] = [:]
+    /// 每屏最近一次读到的 scene canvas 尺寸。热切换会删 canvas-size 文件，新文件没写出前用它重算 crop。
+    private var lastCanvasSizeByScreenID: [String: CGSize] = [:]
     /// 非隔离存储所有活跃 PID，供 deinit 中安全清理
     private nonisolated(unsafe) var _deinitPIDs: Set<pid_t> = []
     /// 启动批次号，防止旧进程的 terminationHandler 污染新进程状态
@@ -866,6 +870,10 @@ final class WallpaperEngineXBridge: ObservableObject {
                 // 否则等待新画布尺寸的任务会把仍可读取的旧文件误判为新场景尺寸，
                 // 在固定比例（如 16:9）下写入错误的 crop。
                 let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
+                if let csURL = existingInfo.canvasSizeURL,
+                   let known = readCanvasSize(url: csURL) {
+                    lastCanvasSizeByScreenID[screenID] = known
+                }
                 if let ccURL = existingInfo.cropControlURL {
                     writeCropControl(url: ccURL, crop: nil, viewport: nil)
                 }
@@ -910,18 +918,12 @@ final class WallpaperEngineXBridge: ObservableObject {
                     )
                 }
 
-                // 新壁纸 canvas 尺寸可能不同，等真实尺寸写出后更新 crop
-                // autoFill 模式不需要写 crop-control，Rust 端默认 Cover 即可
+                // 新壁纸 canvas 尺寸可能不同，等真实尺寸写出后更新 crop。
                 if cropSettings.shouldApplyCrop,
-                   let ccURL = existingInfo.cropControlURL,
+                   existingInfo.cropControlURL != nil,
                    let csURL = existingInfo.canvasSizeURL {
-                    let cropSettingsCopy = cropSettings
-                    let cropControlURLCopy = ccURL
                     let canvasSizeURLCopy = csURL
-                    let screenW_c = screenW
-                    let screenH_c = screenH
                     let screenIDCopy = screenID
-                    // 修复：取消上一次同屏的等待 Task，防止快速切换时 Task 叠加
                     cropWaitTasks[screenIDCopy]?.cancel()
                     cropWaitTasks[screenIDCopy] = Task { @MainActor [weak self] in
                         defer { self?.cropWaitTasks.removeValue(forKey: screenIDCopy) }
@@ -932,17 +934,21 @@ final class WallpaperEngineXBridge: ObservableObject {
                             guard let self else { return }
                             guard self.screenProcesses[screenIDCopy]?.pid == existingInfo.pid else { return }
                             if let realSize = self.readCanvasSize(url: canvasSizeURLCopy) {
-                                let layout = CropLayoutEngine.compute(
-                                    wallpaperSize: realSize,
-                                    screenSize: CGSize(width: screenW_c, height: screenH_c),
-                                    settings: cropSettingsCopy)
-                                let vp = layout.viewportRect
-                                let isFullVp = abs(vp.x) < 1e-4 && abs(vp.y) < 1e-4
-                                    && abs(vp.w - 1) < 1e-4 && abs(vp.h - 1) < 1e-4
-                                self.writeCropControl(url: cropControlURLCopy, crop: layout.wallpaperCropRect, viewport: isFullVp ? nil : vp)
+                                self.lastCanvasSizeByScreenID[screenIDCopy] = realSize
+                                if let screen = NSScreen.screens.first(where: {
+                                    $0.wallpaperScreenIdentifier == screenIDCopy
+                                }) {
+                                    self.applyPersistedCrop(for: screen)
+                                }
                                 print("[WallpaperEngineXBridge] 屏幕 \(screenIDCopy) 热切换后 canvas_size 就绪，crop 已重算")
                                 return
                             }
+                        }
+                        print("[WallpaperEngineXBridge] ⚠️ 屏幕 \(screenIDCopy) 热切换等待 canvas_size 超时，用缓存尺寸恢复 crop")
+                        if let screen = NSScreen.screens.first(where: {
+                            $0.wallpaperScreenIdentifier == screenIDCopy
+                        }) {
+                            self.applyPersistedCrop(for: screen)
                         }
                     }
                 }
@@ -1013,13 +1019,23 @@ final class WallpaperEngineXBridge: ObservableObject {
             let audioControlURL = createAudioControlURL(screenID: screenID)
             let wallpaperControlURL = createWallpaperControlURL(screenID: screenID)
 
-            // 初始裁切
+            // 初始裁切。优先用画布/视频真实尺寸算居中 cover，避免渲染器默认 Cover 偏一侧。
             let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
             let initialLayout: (crop: UnitRect, viewport: UnitRect)? = {
                 guard cropSettings.shouldApplyCrop else { return nil }
-                let wallpaperSize = readCanvasSize(url: canvasSizeURL) ?? CGSize(width: screenW, height: screenH)
+                let wallpaperSize = cropWallpaperSize(
+                    screen: screen,
+                    path: resolvedPath,
+                    canvasSizeURL: canvasSizeURL,
+                    allowCachedCanvas: false
+                )
+                if wallpaperSize == nil,
+                   cropSettings.aspectPreset == .autoFill
+                    || (cropSettings.aspectPreset == .custom && cropSettings.customAspect == nil) {
+                    return nil
+                }
                 let layout = CropLayoutEngine.compute(
-                    wallpaperSize: wallpaperSize,
+                    wallpaperSize: wallpaperSize ?? CGSize(width: screenW, height: screenH),
                     screenSize: CGSize(width: screenW, height: screenH),
                     settings: cropSettings)
                 return (crop: layout.wallpaperCropRect, viewport: layout.viewportRect)
@@ -1092,14 +1108,9 @@ final class WallpaperEngineXBridge: ObservableObject {
 
                 // 异步等待 canvas_size 就绪后重算 crop
                 if cropSettings.shouldApplyCrop {
-                    let cropSettingsCopy = cropSettings
-                    let cropControlURLCopy = cropControlURL
                     let canvasSizeURLCopy = canvasSizeURL
-                    let screenW_c = screenW
-                    let screenH_c = screenH
                     let genCopy = self.launchGeneration
                     let screenIDCopy = screenID
-                    // 修复：取消上一次同屏的等待 Task，防止快速切换时 Task 叠加
                     cropWaitTasks[screenIDCopy]?.cancel()
                     cropWaitTasks[screenIDCopy] = Task { @MainActor [weak self] in
                         defer { self?.cropWaitTasks.removeValue(forKey: screenIDCopy) }
@@ -1111,19 +1122,23 @@ final class WallpaperEngineXBridge: ObservableObject {
                             guard self.launchGeneration == genCopy,
                                   self.screenProcesses[screenIDCopy]?.generation == genCopy else { return }
                             if let realSize = self.readCanvasSize(url: canvasSizeURLCopy) {
-                                let layout = CropLayoutEngine.compute(
-                                    wallpaperSize: realSize,
-                                    screenSize: CGSize(width: screenW_c, height: screenH_c),
-                                    settings: cropSettingsCopy)
-                                let vp = layout.viewportRect
-                                let isFullVp = abs(vp.x) < 1e-4 && abs(vp.y) < 1e-4
-                                    && abs(vp.w - 1) < 1e-4 && abs(vp.h - 1) < 1e-4
-                                self.writeCropControl(url: cropControlURLCopy, crop: layout.wallpaperCropRect, viewport: isFullVp ? nil : vp)
+                                self.lastCanvasSizeByScreenID[screenIDCopy] = realSize
+                                if let screen = NSScreen.screens.first(where: {
+                                    $0.wallpaperScreenIdentifier == screenIDCopy
+                                }) {
+                                    self.applyPersistedCrop(for: screen)
+                                }
                                 print("[WallpaperEngineXBridge] 屏幕 \(screenIDCopy) canvas_size 就绪 (\(Int(realSize.width))×\(Int(realSize.height)))，crop 已按真实尺寸重算并热更新")
                                 return
                             }
                         }
-                        print("[WallpaperEngineXBridge] ⚠️ 屏幕 \(screenIDCopy) 等待 canvas_size 超时，沿用 fallback crop")
+                        print("[WallpaperEngineXBridge] ⚠️ 屏幕 \(screenIDCopy) 等待 canvas_size 超时，用缓存尺寸恢复 crop")
+                        if let self,
+                           let screen = NSScreen.screens.first(where: {
+                               $0.wallpaperScreenIdentifier == screenIDCopy
+                           }) {
+                            self.applyPersistedCrop(for: screen)
+                        }
                     }
                 }
             } catch {
@@ -1252,6 +1267,9 @@ final class WallpaperEngineXBridge: ObservableObject {
             "screenProcesses": screenProcesses.count,
             "screenRenderStates": screenRenderStates.keys.sorted().joined(separator: ",")
         ])
+        for screen in effectiveScreens {
+            applyPersistedCrop(for: screen)
+        }
         // 清除旧的前台暂停状态，避免 reevaluateCurrentState() 对新启动的渲染器误发 SIGSTOP。
         // 用户之后切走应用时，NSWorkspace app activation 通知会重新施加前台暂停。
         if !preserveAutoPauseState {
@@ -3477,12 +3495,46 @@ final class WallpaperEngineXBridge: ObservableObject {
         return CGSize(width: w, height: h)
     }
 
-    /// 供 overlay 预览取 wgpu canvas 尺寸（scene 就绪后才有值）。
+    /// 供 overlay 预览取 wgpu canvas 尺寸（scene 就绪后才有值；未就绪时用 scene.json 画布）。
     func canvasSize(for screen: NSScreen) -> CGSize? {
         let screenID = screen.wallpaperScreenIdentifier
         let info = screenProcesses[screenID]
             ?? screenProcesses.values.first(where: { $0.screenID == screenID })
-        return readCanvasSize(url: info?.canvasSizeURL)
+        return cropWallpaperSize(
+            screen: screen,
+            path: renderState(for: screen)?.path,
+            canvasSizeURL: info?.canvasSizeURL,
+            allowCachedCanvas: true
+        )
+    }
+
+    /// 铺满裁切用的壁纸尺寸：真实画布 > scene ortho / Web 内容 > 缓存。
+    private func cropWallpaperSize(
+        screen: NSScreen,
+        path: String?,
+        canvasSizeURL: URL?,
+        allowCachedCanvas: Bool
+    ) -> CGSize? {
+        if let size = readCanvasSize(url: canvasSizeURL) {
+            return size
+        }
+        if let path, let size = sceneCanvasSize(forPath: path) {
+            return size
+        }
+        if let size = webContentSize(for: screen) {
+            return size
+        }
+        if allowCachedCanvas {
+            return lastCanvasSizeByScreenID[screen.wallpaperScreenIdentifier]
+        }
+        return nil
+    }
+
+    private func sceneCanvasSize(forPath path: String) -> CGSize? {
+        if let cached = sceneCanvasSizeCache[path] { return cached }
+        let size = SceneConfigOverrideService.sceneOrthogonalSize(for: path)
+        sceneCanvasSizeCache[path] = size
+        return size
     }
 
     private func writeAudioControl(url: URL, muted: Bool, paused: Bool, volume: Double) {
@@ -4636,40 +4688,62 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 两者都支持拖拽期间实时热更新，无需重启渲染器。
     @MainActor
     private func handleCropDidChange(_ note: Notification) {
-        guard isControllingExternalEngine else { return }
         guard !isSettingWallpaper else { return }
         guard let screenID = note.userInfo?["screenID"] as? String,
-              let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
-              isManaging(screen: screen) else { return }
+              let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else { return }
+        applyPersistedCrop(for: screen)
+    }
+
+    /// 把当前屏已保存的可视区域写回正在跑的 Scene / Web 渲染器。
+    /// 画布尺寸文件被热切换清掉时，用 `lastCanvasSizeByScreenID` 兜底，避免 crop 丢成全图 Cover。
+    @MainActor
+    private func applyPersistedCrop(for screen: NSScreen) {
+        guard isManaging(screen: screen) else { return }
         if isWebWallpaperOn(screen: screen) {
             sendWebCropToWebDaemon(for: screen)
             return
         }
-        // 找到该屏（或同 fingerprint）的运行进程及其 cropControlURL
+        guard isControllingExternalEngine else { return }
+        let screenID = screen.wallpaperScreenIdentifier
         let info = screenProcesses[screenID]
             ?? screenProcesses.values.first(where: { $0.screenID == screenID })
         guard let cropControlURL = info?.cropControlURL else { return }
 
         let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
-        // 与 wgpu 窗口一致：canvas 尺寸按全屏窗口计算。
         let f = screen.frame
         let screenW = Int(f.width.rounded())
         let screenH = Int(f.height.rounded())
+        let freshSize = readCanvasSize(url: info?.canvasSizeURL)
+        if let freshSize {
+            lastCanvasSizeByScreenID[screenID] = freshSize
+        }
+        let knownSize = cropWallpaperSize(
+            screen: screen,
+            path: renderState(for: screen)?.path,
+            canvasSizeURL: info?.canvasSizeURL,
+            allowCachedCanvas: true
+        )
         let nextCrop: UnitRect?
         let nextViewport: UnitRect?
         if cropSettings.shouldApplyCrop {
-            // 读 wgpu 写出的 canvas 尺寸；读不到 fallback 屏尺寸。
-            let wallpaperSize = readCanvasSize(url: info?.canvasSizeURL) ?? CGSize(width: screenW, height: screenH)
-            let layout = CropLayoutEngine.compute(
-                wallpaperSize: wallpaperSize,
-                screenSize: CGSize(width: screenW, height: screenH),
-                settings: cropSettings)
-            nextCrop = layout.wallpaperCropRect
-            // 全屏 viewport 等价于 None
-            let vp = layout.viewportRect
-            let isFullVp = abs(vp.x) < 1e-4 && abs(vp.y) < 1e-4
-                && abs(vp.w - 1) < 1e-4 && abs(vp.h - 1) < 1e-4
-            nextViewport = isFullVp ? nil : vp
+            let wallpaperSize = knownSize ?? CGSize(width: screenW, height: screenH)
+            let isFillWithoutSize = knownSize == nil
+                && (cropSettings.aspectPreset == .autoFill
+                    || (cropSettings.aspectPreset == .custom && cropSettings.customAspect == nil))
+            if isFillWithoutSize {
+                nextCrop = nil
+                nextViewport = nil
+            } else {
+                let layout = CropLayoutEngine.compute(
+                    wallpaperSize: wallpaperSize,
+                    screenSize: CGSize(width: screenW, height: screenH),
+                    settings: cropSettings)
+                nextCrop = layout.wallpaperCropRect
+                let vp = layout.viewportRect
+                let isFullVp = abs(vp.x) < 1e-4 && abs(vp.y) < 1e-4
+                    && abs(vp.w - 1) < 1e-4 && abs(vp.h - 1) < 1e-4
+                nextViewport = isFullVp ? nil : vp
+            }
         } else {
             nextCrop = nil
             nextViewport = nil
