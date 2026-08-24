@@ -265,6 +265,12 @@ final class WallpaperEngineXBridge: ObservableObject {
             cliScreenIndex = try container.decodeIfPresent(Int.self, forKey: .cliScreenIndex)
         }
     }
+
+    /// Keep the current renderer visible while a replacement warms up behind it.
+    private struct PreservedRenderer {
+        let info: ScreenProcessInfo
+        let state: ScreenRenderState?
+    }
     private var activeRenderKind: RenderKind?
     private var screenRenderStates: [String: ScreenRenderState] = [:] {
         didSet {
@@ -491,6 +497,8 @@ final class WallpaperEngineXBridge: ObservableObject {
     ///   - targetScreens: 目标屏幕列表（nil 表示所有屏幕）
     ///   - userProperties: 用户属性覆盖 JSON（nil 时不传 --user-properties）
     ///   - forceRestart: 强制重启进程（例如屏幕分辨率变化时），默认 false 走热切换
+    ///   - preserveExistingRendererUntilReady: 强制重启时保留旧 renderer 到新 renderer
+    ///     完成首帧准备，避免桌面出现黑场或缩放闪动
     ///   - requireAllTargetScreens: 全局同步事务必须在每个目标屏成功完成；任一屏失败时交由调用方回滚。
     func setWallpaper(
         path: String,
@@ -499,6 +507,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         userProperties: String? = nil,
         forceRestart: Bool = false,
         preserveAutoPauseState: Bool = false,
+        preserveExistingRendererUntilReady: Bool = false,
         requireAllTargetScreens: Bool = false
     ) async throws {
         VideoWallpaperManager.shared.cancelPendingExternalVideoTransition(
@@ -555,6 +564,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         guard !effectiveScreens.isEmpty else {
             throw WallpaperEngineError.executionFailed("没有可用的壁纸目标显示器")
         }
+        var preservedRenderers: [String: PreservedRenderer] = [:]
         WallpaperCrossTypeTransitionCoordinator.shared.invalidatePendingRequests(
             on: effectiveScreens
         )
@@ -790,7 +800,9 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         // 是否需要启动新进程？（至少有一个屏幕无现有进程才生成新 launchGeneration）
         let needsFreshLaunch = effectiveScreens.contains { screenProcesses[$0.wallpaperScreenIdentifier] == nil }
-        if needsFreshLaunch {
+        let needsPreservedReplacement = preserveExistingRendererUntilReady
+            && effectiveScreens.contains { screenProcesses[$0.wallpaperScreenIdentifier] != nil }
+        if needsFreshLaunch || needsPreservedReplacement {
             launchGeneration &+= 1
         }
 
@@ -961,9 +973,28 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
             print("[WallpaperEngineXBridge] 📋   userProperties=\(effectiveUserProperties ?? "nil")")
 
-            if screenProcesses[screenID] != nil {
-                await stopScreenProcess(screenID)
-                guard wallpaperSwitchGeneration == switchGeneration else { return }
+            if let existingInfo = screenProcesses[screenID] {
+                let canPreserve = preserveExistingRendererUntilReady
+                    && existingInfo.process.isRunning
+                    && kill(existingInfo.pid, 0) == 0
+                if canPreserve {
+                    preservedRenderers[screenID] = PreservedRenderer(
+                        info: existingInfo,
+                        state: screenRenderStates[screenID]
+                    )
+                    if let audioControlURL = existingInfo.audioControlURL {
+                        writeAudioControl(
+                            url: audioControlURL,
+                            muted: true,
+                            paused: true,
+                            volume: 0
+                        )
+                    }
+                    print("[WallpaperEngineXBridge] 屏幕 \(screenID) 保留旧 renderer (pid=\(existingInfo.pid))，等待新 renderer 就绪后切换")
+                } else {
+                    await stopScreenProcess(screenID)
+                    guard wallpaperSwitchGeneration == switchGeneration else { return }
+                }
             }
 
             var perScreenArgs = baseArgs
@@ -1016,6 +1047,9 @@ final class WallpaperEngineXBridge: ObservableObject {
 
             // ⭐ 壁纸控制文件（热切换入口，必传）
             perScreenArgs += ["--wallpaper-control", wallpaperControlURL.path]
+            if preservedRenderers[screenID] != nil {
+                perScreenArgs += ["--startup-fade"]
+            }
 
             if let effectiveUserProperties, !effectiveUserProperties.isEmpty {
                 perScreenArgs += ["--user-properties", effectiveUserProperties]
@@ -1094,14 +1128,24 @@ final class WallpaperEngineXBridge: ObservableObject {
                 }
             } catch {
                 print("[WallpaperEngineXBridge] ❌ 屏幕 \(screenID) 启动失败: \(error.localizedDescription)")
-                removeScreenProcess(screenID)
-                screenRenderStates.removeValue(forKey: screenID)
+                // 过渡模式下旧 renderer 仍然是当前可见内容，不能因为新进程
+                // 启动失败而把它的管理记录和控制文件一起删掉。
+                if preservedRenderers[screenID] == nil {
+                    removeScreenProcess(screenID)
+                    screenRenderStates.removeValue(forKey: screenID)
+                }
                 anyLaunchFailed = true
                 failedScreenIDs.insert(screenID)
                 lastLaunchError = error
             }
         }
 
+        if anyLaunchFailed && !preservedRenderers.isEmpty {
+            await discardPreparedRenderersPreservingOld(preservedRenderers)
+            releaseSettingFlag()
+            throw lastLaunchError
+                ?? WallpaperEngineError.executionFailed("唤醒后 renderer 启动失败")
+        }
         // 全局同步不能把“一块屏成功”当成成功：必须让全局协调器回滚到上一张，
         // 否则会留下部分屏新 Scene、部分屏旧 Scene 的分裂状态。
         if anyLaunchFailed && requireAllTargetScreens {
@@ -1136,10 +1180,19 @@ final class WallpaperEngineXBridge: ObservableObject {
             )
         }
 
-        // renderer 已完成热切换或进程启动，此时立刻释放设置标志。首帧稳定等待
-        // 只是过渡收尾，不应阻止用户继续切换 Scene/Web/视频。
-        releaseSettingFlag()
-        guard wallpaperSwitchGeneration == switchGeneration else { return }
+        let preservesExistingRendererUntilReady = !preservedRenderers.isEmpty
+        // renderer 已完成热切换或进程启动。保留旧 renderer 的唤醒恢复还要
+        // 完成一次无黑场交接，因此先保持设置锁，避免新的设置请求抢走进程所有权。
+        if !preservesExistingRendererUntilReady {
+            releaseSettingFlag()
+        }
+        guard wallpaperSwitchGeneration == switchGeneration else {
+            if preservesExistingRendererUntilReady {
+                await discardPreparedRenderersPreservingOld(preservedRenderers)
+                releaseSettingFlag()
+            }
+            return
+        }
 
         if preservesOldWallpaperUntilReady {
             do {
@@ -1164,6 +1217,29 @@ final class WallpaperEngineXBridge: ObservableObject {
             oldWallpaperPresentationHold?.cancel()
             await commitPreparedRendererOverNativeVideo(on: effectiveScreens)
             pendingCrossTypeTransition = nil
+        }
+
+        if preservesExistingRendererUntilReady {
+            do {
+                if !verifiedSceneReadiness {
+                    try await waitForScenePresentationReady(
+                        path: resolvedPath,
+                        screens: effectiveScreens,
+                        generation: switchGeneration
+                    )
+                }
+            } catch {
+                await discardPreparedRenderersPreservingOld(preservedRenderers)
+                releaseSettingFlag()
+                throw error
+            }
+            guard wallpaperSwitchGeneration == switchGeneration else {
+                await discardPreparedRenderersPreservingOld(preservedRenderers)
+                releaseSettingFlag()
+                return
+            }
+            await commitPreparedRenderersReplacingOld(preservedRenderers)
+            releaseSettingFlag()
         }
 
         guard wallpaperSwitchGeneration == switchGeneration else { return }
@@ -3447,7 +3523,8 @@ final class WallpaperEngineXBridge: ObservableObject {
         setProperties: String?,
         upscaling: Bool? = nil,
         upscalingPercent: Int? = nil,
-        effectReduction: Bool? = nil
+        effectReduction: Bool? = nil,
+        presentationAlpha: Double? = nil
     ) -> Bool {
         var dict: [String: Any] = [:]
         if let sw = setWallpaper {
@@ -3470,6 +3547,9 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         if let effectReduction = effectReduction {
             dict["effect_reduction"] = effectReduction
+        }
+        if let presentationAlpha = presentationAlpha {
+            dict["presentationAlpha"] = max(0, min(1, presentationAlpha))
         }
         do {
             let data = try JSONSerialization.data(withJSONObject: dict, options: [])
@@ -3535,6 +3615,108 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
+    /// Stop a renderer that has been detached from `screenProcesses` while its
+    /// replacement was warming up behind it.
+    private func stopDetachedRenderer(_ preserved: PreservedRenderer) async {
+        let info = preserved.info
+        screenWatchdogs[info.pid]?.cancel()
+        screenWatchdogs.removeValue(forKey: info.pid)
+        killAllAudioChildren(pid: info.pid)
+        terminateRenderer(pid: info.pid)
+
+        let gracefulDeadline = Date().addingTimeInterval(0.45)
+        while kill(info.pid, 0) == 0 && Date() < gracefulDeadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        if kill(info.pid, 0) == 0 {
+            kill(info.pid, SIGKILL)
+            let killDeadline = Date().addingTimeInterval(0.30)
+            while kill(info.pid, 0) == 0 && Date() < killDeadline {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+
+        cleanupRendererResources(info)
+        _deinitPIDs.remove(info.pid)
+    }
+
+    /// Remove the replacement and put the still-visible old renderer back into
+    /// the live dictionaries. Used when the replacement never becomes ready.
+    private func discardPreparedRenderersPreservingOld(
+        _ preservedRenderers: [String: PreservedRenderer]
+    ) async {
+        for (screenID, preserved) in preservedRenderers {
+            guard let current = screenProcesses[screenID],
+                  current.pid != preserved.info.pid else {
+                continue
+            }
+            await stopScreenProcess(screenID)
+        }
+
+        for (screenID, preserved) in preservedRenderers {
+            screenProcesses[screenID] = preserved.info
+            if let state = preserved.state {
+                screenRenderStates[screenID] = state
+            }
+            let screen = NSScreen.screens.first {
+                $0.wallpaperScreenIdentifier == screenID
+            }
+            if let audioControlURL = preserved.info.audioControlURL {
+                writeAudioControl(
+                    url: audioControlURL,
+                    muted: VideoWallpaperManager.shared.isMuted,
+                    paused: isExternalPaused,
+                    volume: screen.map { VideoWallpaperManager.shared.volume(for: $0) } ?? 1.0
+                )
+            }
+            _deinitPIDs.insert(preserved.info.pid)
+        }
+        updateControlStateFromScreenStates()
+        persistState()
+    }
+
+    /// The new renderer is ready and ordered behind the old one. Stop the old
+    /// process only now so WindowServer can reveal the prepared replacement
+    /// without exposing a black desktop frame.
+    private func commitPreparedRenderersReplacingOld(
+        _ preservedRenderers: [String: PreservedRenderer]
+    ) async {
+        // Trigger the old renderer's in-process alpha animation. Older
+        // wallpaper-wgpu binaries ignore this unknown control field and still
+        // fall back to the same no-black-frame handoff.
+        for preserved in preservedRenderers.values {
+            if let controlURL = preserved.info.wallpaperControlURL {
+                _ = writeWallpaperControl(
+                    url: controlURL,
+                    setWallpaper: nil,
+                    assets: nil,
+                    setProperties: nil,
+                    presentationAlpha: 0.001
+                )
+            }
+        }
+        try? await Task.sleep(nanoseconds: 380_000_000)
+        for preserved in preservedRenderers.values {
+            await stopDetachedRenderer(preserved)
+        }
+    }
+
+    private func cleanupRendererResources(_ info: ScreenProcessInfo) {
+        try? info.logFile?.close()
+        if let audioControlURL = info.audioControlURL {
+            try? FileManager.default.removeItem(at: audioControlURL)
+        }
+        if let cropControlURL = info.cropControlURL {
+            try? FileManager.default.removeItem(at: cropControlURL)
+        }
+        if let canvasSizeURL = info.canvasSizeURL {
+            try? FileManager.default.removeItem(at: canvasSizeURL)
+        }
+        if let wallpaperControlURL = info.wallpaperControlURL {
+            try? FileManager.default.removeItem(at: wallpaperControlURL)
+        }
+    }
+
     private static func legacyCLIScreenIndex(for screen: NSScreen) -> Int? {
         // 与 wallpaperengine-cli daemon 使用同一套稳定顺序，避免系统枚举打乱后
         // App 与 daemon 的 screen 索引指向不同物理显示器。
@@ -3543,20 +3725,7 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     private func removeScreenProcess(_ screenID: String) {
         if let info = screenProcesses.removeValue(forKey: screenID) {
-            try? info.logFile?.close()
-            if let audioControlURL = info.audioControlURL {
-                try? FileManager.default.removeItem(at: audioControlURL)
-            }
-            if let cropControlURL = info.cropControlURL {
-                try? FileManager.default.removeItem(at: cropControlURL)
-            }
-            if let canvasSizeURL = info.canvasSizeURL {
-                try? FileManager.default.removeItem(at: canvasSizeURL)
-            }
-            // 修复：清理 wallpaperControlURL 临时文件，防止磁盘/FD 泄漏
-            if let wallpaperControlURL = info.wallpaperControlURL {
-                try? FileManager.default.removeItem(at: wallpaperControlURL)
-            }
+            cleanupRendererResources(info)
         }
     }
 
@@ -4440,7 +4609,8 @@ final class WallpaperEngineXBridge: ObservableObject {
                     targetScreens: [screen],
                     userProperties: userProperties,
                     forceRestart: true,
-                    preserveAutoPauseState: true
+                    preserveAutoPauseState: true,
+                    preserveExistingRendererUntilReady: state.renderKind == .scene
                 )
                 print("[WallpaperEngineXBridge] 已恢复唤醒后渲染器 screen=\(screen.wallpaperScreenIdentifier) kind=\(state.renderKind.rawValue)")
             } catch {
