@@ -241,13 +241,18 @@ private struct TopBarCircleButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.88))
+                .foregroundStyle(.white.opacity(isHovered ? 1.0 : 0.88))
                 .frame(width: size, height: size)
                 .contentShape(Circle())
-                .detailGlassCircleChrome()
+                .background { Circle().fill(topBarBaseColor(isHovered: isHovered)) }
+                .detailGlassCircleChrome(
+                    tint: Color.white.opacity(isHovered ? 0.16 : 0.09),
+                    level: .max
+                )
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .scaleEffect(isHovered ? 1.04 : 1.0)
         .preferredColorScheme(.dark)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.16)) {
@@ -274,9 +279,14 @@ struct GuessYouLikeNavButton: View {
             .foregroundStyle(.white.opacity(isHovered ? 0.96 : 0.82))
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .detailGlassCapsuleChrome()
+            .background { Capsule().fill(topBarBaseColor(isHovered: isHovered)) }
+            .detailGlassCapsuleChrome(
+                tint: Color.white.opacity(isHovered ? 0.16 : 0.09),
+                level: .max
+            )
         }
         .buttonStyle(.plain)
+        .scaleEffect(isHovered ? 1.025 : 1.0)
         .preferredColorScheme(.dark)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.16)) {
@@ -284,6 +294,14 @@ struct GuessYouLikeNavButton: View {
             }
         }
     }
+}
+
+private func topBarBaseColor(isHovered: Bool) -> Color {
+    Color(
+        red: isHovered ? 0.34 : 0.25,
+        green: isHovered ? 0.34 : 0.25,
+        blue: isHovered ? 0.34 : 0.25
+    )
 }
 
 // MARK: - 帮助/操作手册弹窗
