@@ -44,6 +44,7 @@ public enum MainTab: String, CaseIterable {
 // MARK: - 顶部导航栏组件
 struct TopNavigationBar: View {
     @Binding var selectedTab: MainTab
+    var isChromeHidden: Bool = false
     let onOpenSettings: () -> Void
     let onGuessYouLike: () -> Void
     let onClose: () -> Void
@@ -88,6 +89,8 @@ struct TopNavigationBar: View {
                         onOpenSettings()
                     }
                 }
+                .opacity(isChromeHidden ? 0 : 1)
+                .allowsHitTesting(!isChromeHidden)
             }
 
             // 顶层：Tabs 绝对居中于整个顶栏宽度
@@ -97,6 +100,8 @@ struct TopNavigationBar: View {
                 controlHeight: controlHeight
             )
             .frame(height: controlHeight, alignment: .center)
+            .opacity(isChromeHidden ? 0 : 1)
+            .allowsHitTesting(!isChromeHidden)
         }
         .padding(.leading, 12)
         .padding(.trailing, 12)

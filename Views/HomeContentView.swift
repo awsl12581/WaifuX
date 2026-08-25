@@ -120,6 +120,7 @@ struct HomeContentView: View {
     @ObservedObject var mediaViewModel: MediaExploreViewModel
     @Binding var selectedWallpaper: Wallpaper?
     @Binding var selectedMedia: MediaItem?
+    @Binding var isHomeChromeHidden: Bool
     let onOpenWallpapers: () -> Void
     let onOpenMedia: () -> Void
     /// 为 false 时不挂载重 UI（非当前 Tab），避免五 Tab 同时跑 ScrollView/轮播
@@ -417,6 +418,9 @@ struct HomeContentView: View {
         .frame(width: width, height: height, alignment: .leading)
         .clipped()
         .contentShape(Rectangle())
+        .onTapGesture {
+            isHomeChromeHidden.toggle()
+        }
         .simultaneousGesture(
             heroCarouselDragGesture(width: width)
         )
