@@ -948,7 +948,7 @@ final class WallpaperEngineXBridge: ObservableObject {
                         if let screen = NSScreen.screens.first(where: {
                             $0.wallpaperScreenIdentifier == screenIDCopy
                         }) {
-                            self.applyPersistedCrop(for: screen)
+                            self?.applyPersistedCrop(for: screen)
                         }
                     }
                 }

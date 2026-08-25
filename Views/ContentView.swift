@@ -177,6 +177,8 @@ private struct HomeTabPage: View {
             mediaViewModel: mediaViewModel,
             selectedWallpaper: navigationState.binding(for: \.selectedWallpaper),
             selectedMedia: navigationState.binding(for: \.selectedMedia),
+            onOpenWallpapers: { navigationState.selectedTab = .wallpaperExplore },
+            onOpenMedia: { navigationState.selectedTab = .mediaExplore },
             isTabActive: navigationState.selectedTab == .home
         )
         .environment(\.coverGIFPlaybackHostActive, navigationState.selectedTab == .home)

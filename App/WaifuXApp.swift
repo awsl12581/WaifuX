@@ -173,6 +173,12 @@ final class EdgeToEdgeHostingView<Content: View>: NSHostingView<Content> {
         ])
     }
 
+    // Let the first click both activate an inactive window and reach SwiftUI
+    // controls. This matches standard macOS control behavior for the main UI.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
